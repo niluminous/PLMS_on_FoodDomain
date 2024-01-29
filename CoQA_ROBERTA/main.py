@@ -20,110 +20,150 @@ evaluation_batch_size = 16
 train_batch_size = 4
 MIN_FLOAT = -1e30
 
+# RoBERTaBaseModel 클래스 정의 (RoBERTa를 기반으로 하는 모델)
 class RobertaBaseModel(RobertaModel):
-    def __init__(self,config, load_pre = False):
-        super(RobertaBaseModel,self).__init__(config)
+    # 초기화 메서드
+    def __init__(self, config, load_pre=False):
+        # RoBERTaModel 클래스의 초기화 메서드 호출
+        super(RobertaBaseModel, self).__init__(config)
+        # 사전 학습된 RoBERTa 모델을 로드할 경우 해당 모델을 불러옴
         self.roberta = RobertaModel.from_pretrained(pretrained_model, config=config,) if load_pre else RobertaModel(config)
+        # 은닉 크기 설정
         hidden_size = config.hidden_size
-        self.fc = nn.Linear(hidden_size,hidden_size, bias = False)
-        self.fc2 = nn.Linear(hidden_size,hidden_size, bias = False)
-        self.rationale_modelling = nn.Linear(hidden_size,1, bias = False)
-        self.attention_modelling = nn.Linear(hidden_size,1, bias = False)
-        self.span_modelling = nn.Linear(hidden_size,2,bias = False)
-        self.unk_modelling = nn.Linear(2*hidden_size,1, bias = False)
-        self.yes_no_modelling = nn.Linear(2*hidden_size,2, bias = False)
+        # 선형 레이어 정의
+        self.fc = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fc2 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.rationale_modelling = nn.Linear(hidden_size, 1, bias=False)
+        self.attention_modelling = nn.Linear(hidden_size, 1, bias=False)
+        self.span_modelling = nn.Linear(hidden_size, 2, bias=False)
+        self.unk_modelling = nn.Linear(2 * hidden_size, 1, bias=False)
+        self.yes_no_modelling = nn.Linear(2 * hidden_size, 2, bias=False)
         self.relu = nn.ReLU()
-        self.beta = 5.0
+        self.beta = 5.0  # 정규화 파라미터
 
-    def forward(self,input_ids,segment_ids=None,input_masks=None,start_positions=None,end_positions=None,rationale_mask=None,cls_idx=None):
-        #RoBERTa outputs
-        outputs = self.roberta(input_ids,attention_mask=input_masks)
+    # forward 메서드 정의
+    def forward(self, input_ids, segment_ids=None, input_masks=None, start_positions=None, end_positions=None,
+                rationale_mask=None, cls_idx=None):
+        # RoBERTa 모델의 출력 얻기
+        outputs = self.roberta(input_ids, attention_mask=input_masks)
         output_vector, roberta_pooled_output = outputs
 
+        # 시작 및 끝 지점에 대한 로짓 계산
         start_end_logits = self.span_modelling(output_vector)
         start_logits, end_logits = start_end_logits.split(1, dim=-1)
         start_logits, end_logits = start_logits.squeeze(-1), end_logits.squeeze(-1)
-        #Rationale modelling 
+
+        # Rationale 모델링
         rationale_logits = self.relu(self.fc(output_vector))
         rationale_logits = self.rationale_modelling(rationale_logits)
         rationale_logits = torch.sigmoid(rationale_logits)
 
+        # 출력 벡터에 Rationale 정보 적용
         output_vector = output_vector * rationale_logits
 
-        attention  = self.relu(self.fc2(output_vector))
-        attention  = (self.attention_modelling(attention)).squeeze(-1)
+        # 어텐션 모델링
+        attention = self.relu(self.fc2(output_vector))
+        attention = (self.attention_modelling(attention)).squeeze(-1)
         input_masks = input_masks.type(attention.dtype)
-        attention = attention*input_masks + (1-input_masks)*MIN_FLOAT
+        attention = attention * input_masks + (1 - input_masks) * MIN_FLOAT
         attention = F.softmax(attention, dim=-1)
         attention_pooled_output = (attention.unsqueeze(-1) * output_vector).sum(dim=-2)
-        cls_output = torch.cat((attention_pooled_output,roberta_pooled_output),dim = -1)
+        cls_output = torch.cat((attention_pooled_output, roberta_pooled_output), dim=-1)
 
+        # Rationale 로짓을 1차원으로 축소
         rationale_logits = rationale_logits.squeeze(-1)
 
+        # unknown 및 yes/no에 대한 로짓 계산
         unk_logits = self.unk_modelling(cls_output)
         yes_no_logits = self.yes_no_modelling(cls_output)
         yes_logits, no_logits = yes_no_logits.split(1, dim=-1)
 
-
+        # 훈련 모드일 경우 손실 계산
         if self.training:
             start_positions, end_positions = start_positions + cls_idx, end_positions + cls_idx
             start = torch.cat((yes_logits, no_logits, unk_logits, start_logits), dim=-1)
             end = torch.cat((yes_logits, no_logits, unk_logits, end_logits), dim=-1)
 
+            # 교차 엔트로피 손실 계산
             Entropy_loss = CrossEntropyLoss()
             start_loss = Entropy_loss(start, start_positions)
             end_loss = Entropy_loss(end, end_positions)
 
+            # Rationale에 대한 손실 계산
             rationale_positions = rationale_mask.type(attention.dtype)
-            rationale_loss = -rationale_positions*torch.log(rationale_logits + 1e-8) - (1-rationale_positions)*torch.log(1-rationale_logits + 1e-8)
+            rationale_loss = -rationale_positions * torch.log(rationale_logits + 1e-8) - (
+                        1 - rationale_positions) * torch.log(1 - rationale_logits + 1e-8)
 
             rationale_loss = torch.mean(rationale_loss)
+            
+            # 총 손실 계산 (시작 및 끝 지점, Rationale)
             total_loss = (start_loss + end_loss) / 2.0 + rationale_loss * self.beta
 
             return total_loss
+        # 훈련 모드가 아닐 경우 결과값 반환
         return start_logits, end_logits, yes_logits, no_logits, unk_logits
+
 
 def convert_to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 def train(train_dataset, model, tokenizer, device):
-
-    train_sampler = RandomSampler(train_dataset) 
+    # 학습 데이터셋의 랜덤 샘플러 및 데이터로더 설정
+    train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=train_batch_size)
-    t_total = len(train_dataloader) // 1 * epochs
-    optimizer_parameters = [{"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in ["bias", "LayerNorm.weight"])],"weight_decay": 0.01,},
-                            {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in ["bias", "LayerNorm.weight"])], "weight_decay": 0.0}]
-    optimizer = AdamW(optimizer_parameters,lr=1e-5, eps=1e-8)
+    t_total = len(train_dataloader) // 1 * epochs  # 총 훈련 스텝 수 계산
+    # 옵티마이저 파라미터 설정
+    optimizer_parameters = [
+        {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in ["bias", "LayerNorm.weight"])],
+         "weight_decay": 0.01,},
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in ["bias", "LayerNorm.weight"])],
+         "weight_decay": 0.0}
+    ]
+    # AdamW 옵티마이저 및 스케줄러 설정
+    optimizer = AdamW(optimizer_parameters, lr=1e-5, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=2000, num_training_steps=t_total)
-    if os.path.isfile(os.path.join(pretrained_model, "optimizer.pt")) and os.path.isfile(os.path.join(pretrained_model, "scheduler.pt")):
-        optimizer.load_state_dict(torch.load(
-            os.path.join(pretrained_model, "optimizer.pt")))
-        scheduler.load_state_dict(torch.load(
-            os.path.join(pretrained_model, "scheduler.pt")))
+
+    # 이전에 저장된 옵티마이저 및 스케줄러 상태 로드
+    if os.path.isfile(os.path.join(pretrained_model, "optimizer.pt")) and os.path.isfile(
+            os.path.join(pretrained_model, "scheduler.pt")):
+        optimizer.load_state_dict(torch.load(os.path.join(pretrained_model, "optimizer.pt")))
+        scheduler.load_state_dict(torch.load(os.path.join(pretrained_model, "scheduler.pt")))
 
     counter = 1
     epochs_trained = 0
     train_loss, loss = 0.0, 0.0
     model.zero_grad()
+
+    # 에폭 반복
     iterator = trange(epochs_trained, int(epochs), desc="Epoch", disable=False)
     for _ in iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=False)
-        for i,batch in enumerate(epoch_iterator):
+        
+        # 미니배치 반복
+        for i, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(device) for t in batch)
-            inputs = { "input_ids": batch[0],"segment_ids": None,
-                  "input_masks": batch[2],"start_positions": batch[3],
-                  "end_positions": batch[4],"rationale_mask": batch[5],"cls_idx": batch[6]}
+            inputs = {
+                "input_ids": batch[0],
+                "segment_ids": None,
+                "input_masks": batch[2],
+                "start_positions": batch[3],
+                "end_positions": batch[4],
+                "rationale_mask": batch[5],
+                "cls_idx": batch[6]
+            }
+            # 손실 계산 및 역전파
             loss = model(**inputs)
             loss.backward()
             train_loss += loss.item()
             optimizer.step()
-            scheduler.step()  
+            scheduler.step()
             model.zero_grad()
             counter += 1
-            epoch_iterator.set_description("Loss :%f" % (train_loss/(4*counter)))
+            epoch_iterator.set_description("Loss : %f" % (train_loss / (4 * counter)))
             epoch_iterator.refresh()
 
+            # 일정 주기로 모델과 옵티마이저 저장
             if counter % 1000 == 0:
                 output_dir = os.path.join(output_directory, "model_weights")
                 if not os.path.exists(output_dir):
@@ -133,23 +173,35 @@ def train(train_dataset, model, tokenizer, device):
                 tokenizer.save_pretrained(output_dir)
                 torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                 torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-    return train_loss/counter
+    return train_loss / counter
 
-def Write_predictions(model, tokenizer, device, dataset_type = None, output_directory = None):
-    dataset, examples, features = load_dataset(tokenizer, evaluate=True,dataset_type = dataset_type)
+def Write_predictions(model, tokenizer, device, dataset_type=None, output_directory=None):
+    # 데이터셋 로드
+    dataset, examples, features = load_dataset(tokenizer, evaluate=True, dataset_type=dataset_type)
 
+    # 출력 디렉토리 생성
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
-    evalutation_sampler = SequentialSampler(dataset)
-    evaluation_dataloader = DataLoader(dataset, sampler=evalutation_sampler, batch_size=evaluation_batch_size)
+
+    # 평가 데이터로더 설정
+    evaluation_sampler = SequentialSampler(dataset)
+    evaluation_dataloader = DataLoader(dataset, sampler=evaluation_sampler, batch_size=evaluation_batch_size)
+
+    # 결과를 저장할 리스트 초기화
     mod_results = []
+
+    # 미니배치 반복하여 예측 수행
     for batch in tqdm(evaluation_dataloader, desc="Evaluating"):
         model.eval()
         batch = tuple(t.to(device) for t in batch)
+        
+        # 추론 수행
         with torch.no_grad():
-            inputs = {"input_ids": batch[0],"segment_ids": batch[1],"input_masks": batch[2]}
+            inputs = {"input_ids": batch[0], "segment_ids": batch[1], "input_masks": batch[2]}
             example_indices = batch[3]
             outputs = model(**inputs)
+
+        # 예측 결과를 모델링된 형태로 변환하여 리스트에 저장
         for i, example_index in enumerate(example_indices):
             eval_feature = features[example_index.item()]
             unique_id = int(eval_feature.unique_id)
@@ -158,7 +210,10 @@ def Write_predictions(model, tokenizer, device, dataset_type = None, output_dire
             result = Result(unique_id=unique_id, start_logits=start_logits, end_logits=end_logits, yes_logits=yes_logits, no_logits=no_logits, unk_logits=unk_logits)
             mod_results.append(result)
 
+    # 예측 결과를 저장할 JSON 파일 경로 지정
     output_prediction_file = os.path.join(output_directory, "predictions.json")
+    
+    # 최종 예측 결과 생성 및 저장
     get_predictions(examples, features, mod_results, 20, 30, True, output_prediction_file, False, tokenizer)
 
 
